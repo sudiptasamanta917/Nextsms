@@ -1,5 +1,7 @@
-import wweb from "whatsapp-web.js";
-const { Client, LocalAuth } = wweb;
+import makeWASocket, {
+    useMultiFileAuthState,
+    DisconnectReason,
+} from "@whiskeysockets/baileys";
 
 import asyncHandler from "express-async-handler";
 import { Business } from "../models/business.model.js";
@@ -8,39 +10,41 @@ import fs from "fs";
 import path from "path";
 
 /* =======================
-   GLOBAL SAFETY GUARD
-   ======================= */
-process.on("unhandledRejection", (reason) => {
-    if (
-        reason?.message?.includes("Target closed") ||
-        reason?.message?.includes("Execution context was destroyed") ||
-        reason?.message?.includes("Protocol error")
-    ) {
-        console.warn("[SAFE-EXIT] Puppeteer target closed, ignoring");
-        return;
-    }
-    console.error("Unhandled Rejection:", reason);
-});
-
-/* =======================
    GLOBAL STATE
-   ======================= */
+======================= */
 export const clients = {};
 const initializing = new Set();
 
 /* =======================
    AUTH PATH
-   ======================= */
+======================= */
 const AUTH_PATH =
     process.env.NODE_ENV === "production"
-        ? "/var/www/nextsms.co.in/next_sms/server/.wwebjs_auth"
-        : path.resolve("./server/.wwebjs_auth");
+        ? "/var/www/nextsms.co.in/next_sms/server/.baileys_auth"
+        : path.resolve("./server/.baileys_auth");
+
+if (!fs.existsSync(AUTH_PATH)) {
+    fs.mkdirSync(AUTH_PATH, { recursive: true });
+}
+
+/* =======================
+   AUTH HELPERS
+======================= */
+const getSessionPath = (businessId) => path.join(AUTH_PATH, businessId);
+
+const deleteSessionFolder = (businessId) => {
+    const sessionPath = getSessionPath(businessId);
+    if (fs.existsSync(sessionPath)) {
+        // console.log(`[AUTH] Deleting auth folder for ${businessId}`);
+        fs.rmSync(sessionPath, { recursive: true, force: true });
+    }
+};
 
 /* =======================
    CLEAN BROKEN SESSION
-   ======================= */
+======================= */
 const cleanBrokenSession = (businessId) => {
-    const sessionPath = path.join(AUTH_PATH, `session-${businessId}`);
+    const sessionPath = getSessionPath(businessId);
     const credsPath = path.join(sessionPath, "creds.json");
 
     if (fs.existsSync(sessionPath) && !fs.existsSync(credsPath)) {
@@ -51,143 +55,110 @@ const cleanBrokenSession = (businessId) => {
 
 /* =======================
    RESTORE SESSIONS
-   ======================= */
+======================= */
 export const restoreSessions = async () => {
-    console.log(`[SESSION RESTORE] Checking ${AUTH_PATH}`);
+    // console.log("[SESSION RESTORE] Checking saved Baileys sessions");
 
     if (!fs.existsSync(AUTH_PATH)) return;
 
-    const dirs = fs
-        .readdirSync(AUTH_PATH)
-        .filter((d) => d.startsWith("session-"));
+    const sessions = fs.readdirSync(AUTH_PATH);
 
-    for (const dir of dirs) {
-        const businessId = dir.replace("session-", "");
-        const creds = path.join(AUTH_PATH, dir, "creds.json");
+    for (const businessId of sessions) {
+        const sessionPath = path.join(AUTH_PATH, businessId);
+        if (!fs.statSync(sessionPath).isDirectory()) continue;
 
-        if (!fs.existsSync(creds)) {
-            cleanBrokenSession(businessId);
-            continue;
-        }
-
-        await initializeClient(businessId);
+        cleanBrokenSession(businessId);
+        initializeClient(businessId);
     }
 };
 
 /* =======================
    INITIALIZE CLIENT
-   ======================= */
+======================= */
 const initializeClient = async (businessId) => {
     if (clients[businessId] || initializing.has(businessId)) return;
 
-    cleanBrokenSession(businessId);
     initializing.add(businessId);
+    cleanBrokenSession(businessId);
 
-    console.log(`[INIT] Initializing WhatsApp for ${businessId}`);
+    // console.log(`[INIT] Initializing Baileys for ${businessId}`);
 
-    try {
-        const client = new Client({
-            authStrategy: new LocalAuth({
-                clientId: businessId,
-                dataPath: AUTH_PATH,
-            }),
-            puppeteer: {
-                headless: false, // IMPORTANT for stability
-                args: [
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-background-timer-throttling",
-                    "--disable-backgrounding-occluded-windows",
-                ],
-            },
-        });
+    const sessionPath = getSessionPath(businessId);
+    const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
 
-        clients[businessId] = {
-            instance: client,
-            status: "initializing",
-            qr: null,
-        };
-
-        client.on("qr", (qr) => handleQr(businessId, qr));
-        client.on("ready", () => handleReady(businessId));
-        client.on("auth_failure", (msg) =>
-            handleClientDisconnect(businessId, msg)
-        );
-        client.on("disconnected", (reason) =>
-            handleClientDisconnect(businessId, reason)
-        );
-
-        await client.initialize();
-    } catch (err) {
-        console.error(`[INIT ERROR] ${businessId}`, err.message);
-        initializing.delete(businessId);
-        await handleClientDisconnect(businessId, err.message);
-    }
-};
-
-/* =======================
-   QR HANDLER
-   ======================= */
-const handleQr = async (businessId, qr) => {
-    const clientData = clients[businessId];
-    if (!clientData || clientData.status === "disconnected") return;
-
-    console.log(`[QR] Generated for ${businessId}`);
-
-    clientData.qr = await qrcode.toDataURL(qr);
-    await Business.findByIdAndUpdate(businessId, {
-        sessionStatus: "qr_pending",
-    });
-};
-
-/* =======================
-   READY HANDLER
-   ======================= */
-const handleReady = async (businessId) => {
-    const clientData = clients[businessId];
-    if (!clientData || clientData.status === "ready") return;
-
-    console.log(`[READY] Client ready for ${businessId}`);
-
-    clientData.status = "ready";
-    clientData.qr = null;
-
-    initializing.delete(businessId);
-
-    await Business.findByIdAndUpdate(businessId, {
-        sessionStatus: "connected",
-    });
-};
-
-/* =======================
-   DISCONNECT HANDLER
-   ======================= */
-const handleClientDisconnect = async (businessId, reason) => {
-    console.warn(`[DISCONNECTED] ${businessId}. Reason: ${reason}`);
-
-    const clientData = clients[businessId];
-
-    if (clientData?.instance) {
-        try {
-            await clientData.instance.destroy();
-        } catch (_) {}
-    }
-
-    delete clients[businessId];
-    initializing.delete(businessId);
-
-    await Business.findByIdAndUpdate(businessId, {
-        sessionStatus: "disconnected",
+    const sock = makeWASocket({
+        auth: state,
+        printQRInTerminal: false,
+        syncFullHistory: false,
+        markOnlineOnConnect: false,
+        browser: ["NextSMS", "Chrome", "1.0"],
     });
 
-    // IMPORTANT: Do NOT auto reconnect on LOGOUT
+    clients[businessId] = {
+        sock,
+        status: "initializing",
+        qr: null,
+    };
+
+    sock.ev.on("creds.update", saveCreds);
+
+    sock.ev.on("connection.update", async (update) => {
+        const { connection, lastDisconnect, qr } = update;
+
+        /* -------- QR -------- */
+        if (qr) {
+            // console.log(`[QR] Generated for ${businessId}`);
+            clients[businessId].qr = await qrcode.toDataURL(qr);
+
+            await Business.findByIdAndUpdate(businessId, {
+                sessionStatus: "qr_pending",
+            });
+        }
+
+        /* -------- READY -------- */
+        if (connection === "open") {
+            // console.log(`[READY] Client ready for ${businessId}`);
+
+            initializing.delete(businessId);
+            clients[businessId].status = "ready";
+            clients[businessId].qr = null;
+
+            await Business.findByIdAndUpdate(businessId, {
+                sessionStatus: "connected",
+            });
+        }
+
+        /* -------- DISCONNECTED -------- */
+        if (connection === "close") {
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const code = statusCode || lastDisconnect?.error?.message;
+
+            console.warn(`[DISCONNECTED] ${businessId}`, code);
+
+            delete clients[businessId];
+            initializing.delete(businessId);
+
+            await Business.findByIdAndUpdate(businessId, {
+                sessionStatus: "disconnected",
+            });
+
+            /* AUTO RECONNECT (NOT LOGOUT) */
+            if (statusCode !== DisconnectReason.loggedOut) {
+                // console.log(`[RECONNECT] Reconnecting ${businessId}...`);
+                setTimeout(() => initializeClient(businessId), 3000);
+            } else {
+                // console.log(`[LOGOUT] Clearing session for ${businessId}`);
+                // Clear auth so next connect will force a fresh QR
+                deleteSessionFolder(businessId);
+                // Do not auto-reconnect; wait for explicit /session/connect
+            }
+        }
+    });
 };
 
 /* =======================
    API: CONNECT SESSION
-   ======================= */
+======================= */
 export const connectSession = asyncHandler(async (req, res) => {
     const businessId = req.business._id.toString();
 
@@ -195,7 +166,7 @@ export const connectSession = asyncHandler(async (req, res) => {
         return res.status(409).json({ message: "Session already active" });
     }
 
-    await initializeClient(businessId);
+    initializeClient(businessId);
 
     let attempts = 0;
     const timer = setInterval(() => {
@@ -213,25 +184,52 @@ export const connectSession = asyncHandler(async (req, res) => {
 
 /* =======================
    API: SESSION STATUS
-   ======================= */
+======================= */
 export const getSessionStatus = asyncHandler(async (req, res) => {
     const businessId = req.business._id.toString();
     const client = clients[businessId];
 
-    if (client?.status === "ready") return res.json({ status: "connected" });
+    if (client?.status === "ready") {
+        return res.json({ status: "connected" });
+    }
 
-    if (client?.qr) return res.json({ status: "qr_pending" });
+    if (client?.qr) {
+        return res.json({ status: "qr_pending" });
+    }
 
     const business = await Business.findById(businessId);
-    return res.json({ status: business?.sessionStatus || "disconnected" });
+    return res.json({
+        status: business?.sessionStatus || "disconnected",
+    });
 });
 
 /* =======================
    API: DISCONNECT SESSION
-   ======================= */
+======================= */
 export const disconnectSession = asyncHandler(async (req, res) => {
     const businessId = req.business._id.toString();
-    await handleClientDisconnect(businessId, "USER_LOGOUT");
+    const client = clients[businessId];
+
+    if (client?.sock) {
+        try {
+            await client.sock.logout();
+        } catch (e) {
+            console.warn(
+                `[LOGOUT] Error during logout for ${businessId}:`,
+                e?.message
+            );
+        }
+    }
+
+    delete clients[businessId];
+    initializing.delete(businessId);
+
+    // Ensure auth is fully cleared so next connect requires QR
+    deleteSessionFolder(businessId);
+
+    await Business.findByIdAndUpdate(businessId, {
+        sessionStatus: "disconnected",
+    });
 
     res.json({ message: "Disconnected successfully" });
 });
