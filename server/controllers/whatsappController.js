@@ -8,6 +8,7 @@ import { Business } from "../models/business.model.js";
 import qrcode from "qrcode";
 import fs from "fs";
 import path from "path";
+import os from "os";
 
 /* =======================
    GLOBAL STATE
