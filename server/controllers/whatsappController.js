@@ -19,9 +19,7 @@ const initializing = new Set();
    AUTH PATH
 ======================= */
 const AUTH_PATH =
-    process.env.NODE_ENV === "production"
-        ? "/var/www/nextsms.co.in/next_sms/server/.baileys_auth"
-        : path.resolve("./server/.baileys_auth");
+    process.env.NODE_ENV === "production" ? path.join(os.tmpdir(), "baileys_auth") : path.resolve("./.baileys_auth"); 
 
 if (!fs.existsSync(AUTH_PATH)) {
     fs.mkdirSync(AUTH_PATH, { recursive: true });
