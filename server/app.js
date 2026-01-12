@@ -54,13 +54,6 @@ app.use('/api/history', historyRoutes);
 app.use('/api/contact', contactRoutes);
 app.use('/api/media', mediaRoutes);
 
-
-app.post(
-  '/api/payment/webhook',
-  express.raw({ type: 'application/json' }),
-  handleWebhook
-);
-
 // Other payment routes
 app.use('/api/payment', paymentRoutes);
 
